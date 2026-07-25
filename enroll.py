@@ -1,23 +1,3 @@
-"""
-enroll.py — face enrollment web UI (mobile-friendly)
-
-open http://<your-ip>:5001 on your phone
-
-grid:
-  cols (X): 5 positions, left → right
-  rows (Z): 3 distances, near → far
-
-per-cell: captures N_CAPTURES_PER_CELL face crops + embeddings via insightface
-saves to enroll/<person_name>/ as .npz files
-
-usage:
-    python enroll.py --name "Alice"
-    python enroll.py --name "Alice" --captures 5   # per cell, default 3
-
-press "Capture" on your phone when you're in position.
-the grid highlights your current cell and which cells are done.
-"""
-
 import argparse
 import base64
 import json
@@ -42,11 +22,11 @@ from insightface.app import FaceAnalysis
 
 # ── grid config ────────────────────────────────────────────────────────────────
 GRID_COLS = 5   # X positions: left → right
-GRID_ROWS = 3   # Z positions: near → far
+GRID_ROWS = 5   # Z positions: near → far (expanded by 2 rows)
 
 # depth thresholds (mm) for Z buckets — tune to your space
-# near: <1200mm, mid: 1200-1800mm, far: >1800mm
-Z_THRESHOLDS = [0, 1200, 1800, 9999]   # len = GRID_ROWS + 1
+# 5 rows total: closer steps added at the front, further steps pushed back
+Z_THRESHOLDS = [0, 800, 1200, 1800, 2400, 9999]   # len = GRID_ROWS + 1
 
 # X thresholds as fraction of frame width (0.0 = left, 1.0 = right)
 X_FRACTIONS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]  # len = GRID_COLS + 1
@@ -65,9 +45,10 @@ _state = {
     "done_cells":    {},      # (col, row) -> count of captures
     "last_frame_b64": None,
     "status":        "waiting",   # waiting | detected | captured | done
-    "status_msg":    "Stand in front of the Kinect",
+    "status_msg":    "Enter your name and stand in front of the Kinect",
     "total_cells":   GRID_COLS * GRID_ROWS,
     "n_per_cell":    N_CAPTURES_PER_CELL,
+    "mode":          "auto",      # auto | ir | rgb (manual toggle state)
 }
 _lock = threading.Lock()
 
@@ -83,7 +64,7 @@ def x_to_col(x_px: int) -> int:
 
 
 def z_to_row(z_mm: float) -> int | None:
-    """near=row 0, far=row 2. returns None if z is 0 (no depth data)"""
+    """near=row 0, far=row 4. returns None if z is 0 (no depth data)"""
     if z_mm <= 0:
         return None
     for i in range(GRID_ROWS):
@@ -111,7 +92,6 @@ def save_capture(name: str, cell: tuple, face_img: np.ndarray, embedding: np.nda
 
 
 # ── capture trigger interface ──────────────────────────────────────────────────
-# swap this class out for AutoCaptureTrigger when you want dwell-based capture
 
 class ManualTrigger:
     """fires when capture() is called externally (e.g. from HTTP endpoint)"""
@@ -129,41 +109,6 @@ class ManualTrigger:
 
     def reset(self):
         self._pending.clear()
-
-
-# placeholder for future auto-capture
-class DwellTrigger:
-    """fires after person holds position for dwell_s seconds"""
-    def __init__(self, dwell_s: float = 2.0):
-        self.dwell_s = dwell_s
-        self._cell_since = {}   # cell -> time first seen
-        self._fired = set()     # cells already fired this dwell
-
-    def should_capture(self, cell) -> bool:
-        if cell is None:
-            return False
-        now = time.time()
-        if cell not in self._cell_since:
-            self._cell_since[cell] = now
-        elapsed = now - self._cell_since[cell]
-        if elapsed >= self.dwell_s and cell not in self._fired:
-            self._fired.add(cell)
-            return True
-        return False
-
-    def reset_cell(self, cell):
-        self._cell_since.pop(cell, None)
-        self._fired.discard(cell)
-
-    def reset(self):
-        self._cell_since.clear()
-        self._fired.clear()
-
-    def dwell_progress(self, cell) -> float:
-        """0.0-1.0 progress toward dwell threshold"""
-        if cell not in self._cell_since:
-            return 0.0
-        return min(1.0, (time.time() - self._cell_since[cell]) / self.dwell_s)
 
 
 # ── flask app ──────────────────────────────────────────────────────────────────
@@ -189,6 +134,7 @@ def get_state():
             "total_needed":   _state["total_cells"] * _state["n_per_cell"],
             "person_name":    _state["person_name"],
             "frame_b64":      _state["last_frame_b64"],
+            "mode":           _state["mode"],
         })
 
 
@@ -198,9 +144,20 @@ def capture():
     return jsonify({"ok": True})
 
 
+@app.route("/config", methods=["POST"])
+def update_config():
+    data = request.json or {}
+    with _lock:
+        if "person_name" in data:
+            _state["person_name"] = data["person_name"].strip()
+        if "mode" in data:
+            _state["mode"] = data["mode"]
+    return jsonify({"ok": True})
+
+
 # ── tracking loop (runs in background thread) ──────────────────────────────────
 
-def tracking_loop(person_name: str, n_per_cell: int, out_dir: str):
+def tracking_loop(default_n_per_cell: int, base_out_dir: str):
     face_app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
     face_app.prepare(ctx_id=0, det_size=(640, 640))
 
@@ -217,12 +174,24 @@ def tracking_loop(person_name: str, n_per_cell: int, out_dir: str):
 
             bgr = rgb[:, :, :3]
 
-            # ── face detection (IR fallback in low light) ──────────────────
-            use_ir = ir is not None and _is_dark(rgb)
-            if use_ir:
+            with _lock:
+                current_name = _state["person_name"]
+                current_mode = _state["mode"]
+                n_per_cell = _state["n_per_cell"]
+
+            # ── determine input mode (auto, ir, rgb) ───────────────────────
+            if current_mode == "ir":
+                use_ir = True
+            elif current_mode == "rgb":
+                use_ir = False
+            else:
+                use_ir = ir is not None and _is_dark(rgb)
+
+            if use_ir and ir is not None:
                 detect_img = _ir_to_detection_image(ir)
             else:
                 detect_img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                use_ir = False
 
             faces_raw = face_app.get(detect_img)
             faces = [{"bbox": tuple(map(int, f.bbox)), "embedding": f.embedding,
@@ -234,11 +203,9 @@ def tracking_loop(person_name: str, n_per_cell: int, out_dir: str):
             # ── associate face → body ──────────────────────────────────────
             associations = associate_faces_to_bodies(faces, bodies)
 
-            # pick the primary subject (closest / largest face)
             subject_face = None
             subject_body = None
             if associations:
-                # largest face bbox = most prominent person
                 best = max(associations, key=lambda a: (
                     (a["face"]["bbox"][2] - a["face"]["bbox"][0]) *
                     (a["face"]["bbox"][3] - a["face"]["bbox"][1])
@@ -255,7 +222,7 @@ def tracking_loop(person_name: str, n_per_cell: int, out_dir: str):
                 if row is not None:
                     current_cell = (col, row)
 
-            # ── draw overlay (use IR image as base in low light) ───────────
+            # ── draw overlay ───────────────────────────────────────────────
             if use_ir:
                 vis = cv2.cvtColor(detect_img, cv2.COLOR_RGB2BGR)
             else:
@@ -275,13 +242,14 @@ def tracking_loop(person_name: str, n_per_cell: int, out_dir: str):
                 done = dict(_state["done_cells"])
 
             captured_now = False
-            if _trigger.should_capture() and current_cell and subject_face:
+            if _trigger.should_capture() and current_cell and subject_face and current_name:
                 n_so_far = done.get(current_cell, 0)
                 if n_so_far < n_per_cell:
                     x1, y1, x2, y2 = subject_face["bbox"]
                     face_crop = bgr[max(0,y1):y2, max(0,x1):x2]
                     embedding = subject_face["embedding"]
-                    save_capture(person_name, current_cell, face_crop,
+                    out_dir = os.path.join(base_out_dir, current_name)
+                    save_capture(current_name, current_cell, face_crop,
                                  embedding, n_so_far, out_dir)
                     done[current_cell] = n_so_far + 1
                     captured_now = True
@@ -290,9 +258,12 @@ def tracking_loop(person_name: str, n_per_cell: int, out_dir: str):
             total_captured = sum(done.values())
             total_needed   = GRID_COLS * GRID_ROWS * n_per_cell
 
-            if total_captured >= total_needed:
+            if not current_name:
+                status = "waiting"
+                msg = "Enter your name above to begin"
+            elif total_captured >= total_needed:
                 status = "done"
-                msg = f"Enrollment complete! {total_captured} captures saved."
+                msg = f"Enrollment complete for {current_name}! {total_captured} captures saved."
             elif captured_now:
                 col, row = current_cell
                 status = "captured"
@@ -316,8 +287,6 @@ def tracking_loop(person_name: str, n_per_cell: int, out_dir: str):
                 _state["status"]         = status
                 _state["status_msg"]     = msg
                 _state["last_frame_b64"] = frame_b64
-                _state["person_name"]    = person_name
-                _state["n_per_cell"]     = n_per_cell
 
 
 # ── HTML (single-file, no external deps) ──────────────────────────────────────
@@ -353,13 +322,51 @@ INDEX_HTML = """<!DOCTYPE html>
     padding: 16px;
   }
 
-  /* header */
+  /* header & config */
   header {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .header-top {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
   }
-  .person-name { font-size: 1.1rem; font-weight: 600; letter-spacing: .02em; }
+  .name-input-group {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .name-input {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 8px 12px;
+    font-family: inherit;
+    font-size: 0.9rem;
+    outline: none;
+    width: 100%;
+    max-width: 200px;
+  }
+  .name-input:focus { border-color: var(--blue); }
+  .mode-toggle {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--muted);
+    padding: 8px 12px;
+    font-family: inherit;
+    font-size: 0.75rem;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  .mode-toggle.active {
+    border-color: var(--blue);
+    color: var(--blue);
+    background: #102030;
+  }
   .progress-label { font-size: .75rem; color: var(--muted); }
 
   /* progress bar */
@@ -445,12 +452,12 @@ INDEX_HTML = """<!DOCTYPE html>
     color: var(--green);
   }
   .cell-dot {
-    width: 6px; height: 6px;
+    width: 5px; height: 5px;
     border-radius: 50%;
     background: currentColor;
-    margin-bottom: 3px;
+    margin-bottom: 2px;
   }
-  .cell-count { font-size: .55rem; }
+  .cell-count { font-size: .5rem; }
 
   /* you-are-here indicator */
   .you-marker {
@@ -464,18 +471,18 @@ INDEX_HTML = """<!DOCTYPE html>
   /* z-axis labels on left */
   .grid-with-labels {
     display: grid;
-    grid-template-columns: 28px 1fr;
+    grid-template-columns: 36px 1fr;
     gap: 6px;
     align-items: center;
   }
   .z-labels {
     display: grid;
-    grid-template-rows: repeat(3, 1fr);
+    grid-template-rows: repeat(5, 1fr);
     gap: var(--cell-gap);
     height: 100%;
   }
   .z-label {
-    font-size: .55rem;
+    font-size: .5rem;
     color: var(--muted);
     text-align: right;
     display: flex;
@@ -485,7 +492,7 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .grid-rows {
     display: grid;
-    grid-template-rows: repeat(3, 1fr);
+    grid-template-rows: repeat(5, 1fr);
     gap: var(--cell-gap);
   }
 
@@ -534,8 +541,13 @@ INDEX_HTML = """<!DOCTYPE html>
 <body>
 
 <header>
-  <div class="person-name" id="personName">—</div>
-  <div class="progress-label" id="progressLabel">0 / 0</div>
+  <div class="header-top">
+    <div class="name-input-group">
+      <input type="text" id="personNameInput" class="name-input" placeholder="Enter name...">
+      <button id="modeBtn" class="mode-toggle">Mode: AUTO</button>
+    </div>
+    <div class="progress-label" id="progressLabel">0 / 0</div>
+  </div>
 </header>
 
 <div class="progress-track">
@@ -551,22 +563,25 @@ INDEX_HTML = """<!DOCTYPE html>
   <div class="axis-label">← left &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; right →</div>
   <div class="grid-with-labels">
     <div class="z-labels">
+      <div class="z-label">front</div>
       <div class="z-label">near</div>
       <div class="z-label">mid</div>
       <div class="z-label">far</div>
+      <div class="z-label">deep</div>
     </div>
     <div class="grid-rows" id="gridRows"></div>
   </div>
 </div>
 
-<div class="status-bar waiting" id="statusBar">Stand in front of the Kinect</div>
+<div class="status-bar waiting" id="statusBar">Enter your name above to begin</div>
 
 <button class="capture-btn" id="captureBtn" disabled>CAPTURE</button>
 
 <script>
-const COLS = 5, ROWS = 3;
+const COLS = 5, ROWS = 5;
 let cells = {};   // "col,row" -> DOM element
-let lastFrameB64 = null;
+let currentMode = 'auto';
+let nameInputDebounce = null;
 
 // build grid
 const gridRows = document.getElementById('gridRows');
@@ -584,13 +599,20 @@ for (let row = 0; row < ROWS; row++) {
 }
 
 function updateUI(s) {
-  // name + progress
-  document.getElementById('personName').textContent = s.person_name || '—';
+  // progress
   const pct = s.total_needed > 0
     ? Math.round(s.total_captured / s.total_needed * 100) : 0;
   document.getElementById('progressLabel').textContent =
     `${s.total_captured} / ${s.total_needed}`;
   document.getElementById('progressFill').style.width = pct + '%';
+
+  // sync mode button state if changed remotely
+  if (s.mode && s.mode !== currentMode) {
+    currentMode = s.mode;
+    const modeBtn = document.getElementById('modeBtn');
+    modeBtn.textContent = 'Mode: ' + currentMode.toUpperCase();
+    modeBtn.className = 'mode-toggle' + (currentMode !== 'auto' ? ' active' : '');
+  }
 
   // camera frame
   if (s.frame_b64) {
@@ -612,7 +634,6 @@ function updateUI(s) {
     el.className = 'cell' + (isDone ? ' done' : '') + (isCurrent ? ' current' : '');
     el.querySelector('.cell-count').textContent = `${count}/${s.n_per_cell}`;
 
-    // you-marker
     let marker = el.querySelector('.you-marker');
     if (isCurrent && !isDone) {
       if (!marker) {
@@ -632,12 +653,13 @@ function updateUI(s) {
 
   // button
   const btn = document.getElementById('captureBtn');
+  const nameVal = document.getElementById('personNameInput').value.trim();
   if (s.status === 'done') {
     btn.textContent = 'COMPLETE ✓';
     btn.disabled = true;
   } else {
     btn.textContent = 'CAPTURE';
-    btn.disabled = (s.status === 'waiting');
+    btn.disabled = (s.status === 'waiting' || !nameVal);
   }
 }
 
@@ -651,6 +673,36 @@ async function poll() {
   setTimeout(poll, 150);
 }
 poll();
+
+// name input sync
+document.getElementById('personNameInput').addEventListener('input', (e) => {
+  clearTimeout(nameInputDebounce);
+  const val = e.target.value;
+  nameInputDebounce = setTimeout(async () => {
+    await fetch('/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ person_name: val })
+    });
+  }, 200);
+});
+
+// mode toggle button
+document.getElementById('modeBtn').addEventListener('click', async () => {
+  if (currentMode === 'auto') currentMode = 'rgb';
+  else if (currentMode === 'rgb') currentMode = 'ir';
+  else currentMode = 'auto';
+
+  const modeBtn = document.getElementById('modeBtn');
+  modeBtn.textContent = 'Mode: ' + currentMode.toUpperCase();
+  modeBtn.className = 'mode-toggle' + (currentMode !== 'auto' ? ' active' : '');
+
+  await fetch('/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: currentMode })
+  });
+});
 
 // capture button
 document.getElementById('captureBtn').addEventListener('click', async () => {
@@ -666,26 +718,22 @@ document.getElementById('captureBtn').addEventListener('click', async () => {
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--name",     required=True, help="person name for enrollment")
     parser.add_argument("--captures", type=int, default=N_CAPTURES_PER_CELL,
                         help="captures per grid cell (default 3)")
     parser.add_argument("--out",      default="enroll", help="output directory")
     parser.add_argument("--port",     type=int, default=5001)
     args = parser.parse_args()
 
-    out_dir = os.path.join(args.out, args.name)
-    print(f"enrolling: {args.name}")
-    print(f"output:    {out_dir}")
-    print(f"grid:      {GRID_COLS}×{GRID_ROWS}, {args.captures} captures/cell "
+    print(f"output base: {args.out}")
+    print(f"grid:        {GRID_COLS}×{GRID_ROWS}, {args.captures} captures/cell "
           f"({GRID_COLS * GRID_ROWS * args.captures} total)")
 
     with _lock:
-        _state["person_name"] = args.name
-        _state["n_per_cell"]  = args.captures
+        _state["n_per_cell"] = args.captures
 
     t = threading.Thread(
         target=tracking_loop,
-        args=(args.name, args.captures, out_dir),
+        args=(args.captures, args.out),
         daemon=True,
     )
     t.start()

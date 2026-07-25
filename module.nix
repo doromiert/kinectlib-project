@@ -1,4 +1,4 @@
-{...}:
+{pkgs, lib, ...}:
 let
   libfreenect2 = pkgs.stdenv.mkDerivation rec {
       pname = "libfreenect2";
