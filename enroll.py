@@ -34,6 +34,7 @@ import sys
 sys.path.insert(0, ".")
 from kinect import Kinect
 from pose import PoseTracker, associate_faces_to_bodies
+from hands import _is_dark, _ir_to_detection_image
 
 # insightface
 import insightface
@@ -216,8 +217,14 @@ def tracking_loop(person_name: str, n_per_cell: int, out_dir: str):
 
             bgr = rgb[:, :, :3]
 
-            # ── face detection ─────────────────────────────────────────────
-            faces_raw = face_app.get(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            # ── face detection (IR fallback in low light) ──────────────────
+            use_ir = ir is not None and _is_dark(rgb)
+            if use_ir:
+                detect_img = _ir_to_detection_image(ir)
+            else:
+                detect_img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+            faces_raw = face_app.get(detect_img)
             faces = [{"bbox": tuple(map(int, f.bbox)), "embedding": f.embedding,
                       "kps": f.kps} for f in faces_raw]
 
@@ -248,8 +255,11 @@ def tracking_loop(person_name: str, n_per_cell: int, out_dir: str):
                 if row is not None:
                     current_cell = (col, row)
 
-            # ── draw overlay ───────────────────────────────────────────────
-            vis = bgr.copy()
+            # ── draw overlay (use IR image as base in low light) ───────────
+            if use_ir:
+                vis = cv2.cvtColor(detect_img, cv2.COLOR_RGB2BGR)
+            else:
+                vis = bgr.copy()
             if subject_face:
                 x1, y1, x2, y2 = subject_face["bbox"]
                 color = (80, 220, 80) if current_cell else (80, 80, 220)

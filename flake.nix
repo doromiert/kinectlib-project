@@ -90,6 +90,14 @@
         opencv4
       ]);
 
+      # openwakeword isn't in nixpkgs, install via pip into the venv
+      # listed here just so the comment is near the shell that uses it
+      trainerPythonEnv = pkgs.python3.withPackages (ps: with ps; [
+        numpy
+        flask
+        pyaudio
+      ]);
+
     in
     {
       packages.${system} = {
@@ -102,36 +110,111 @@
         program = "${libfreenect2}/bin/Protonect";
       };
 
-      devShells.${system}.default = pkgs.mkShell {
-        name = "kinect-dev";
+      devShells.${system} = {
+        default = pkgs.mkShell {
+          name = "kinect-dev";
+
+          packages = [
+            pythonEnv
+            pkgs.python3Packages.pip
+            libfreenect2
+            kinect-shim
+            pkgs.python3Packages.pygame
+            pkgs.python3Packages.flask
+            pkgs.python3Packages.insightface
+            pkgs.python3Packages.onnxruntime
+            pkgs.python3Packages.pyaudio
+
+          ] ++ runtimeLibs;
+
+          shellHook = ''
+            export KINECT_SHIM_SO="${kinect-shim}/lib/libkinect_shim.so"
+            export LD_LIBRARY_PATH="${libfreenect2}/lib:${kinect-shim}/lib:${pkgs.lib.makeLibraryPath runtimeLibs}:$LD_LIBRARY_PATH"
+
+            if [ ! -d .venv ]; then
+              python -m venv --system-site-packages .venv
+              echo "created .venv — installing mediapipe + faster-whisper..."
+              .venv/bin/pip install -q mediapipe faster-whisper
+            fi
+            source .venv/bin/activate
+
+            echo "kinect dev shell ready"
+            echo "shim: $KINECT_SHIM_SO"
+          '';
+        };
+
+        # nix develop .#trainer
+        # runs trainer.py (wake word sample recorder) and sets up the
+        # CoreWorxLab training pipeline in a local venv.
+        #
+        # NOTE: the CoreWorxLab docker container is CUDA-only — your RX 6900 XT
+        # won't be used by it. to actually use ROCm, skip docker and run training
+        # via the venv directly (pytorch-rocm is pip-installable):
+        #   pip install torch torchvision torchaudio \
+        #     --index-url https://download.pytorch.org/whl/rocm6.1
+        # then run train.py directly instead of via docker compose.
+        trainer = pkgs.mkShell {
+        name = "wakeword-trainer";
 
         packages = [
-          pythonEnv
+          trainerPythonEnv
           pkgs.python3Packages.pip
-          libfreenect2
-          kinect-shim
-          pkgs.python3Packages.pygame
-          pkgs.python3Packages.flask
-          pkgs.python3Packages.insightface
-          pkgs.python3Packages.onnxruntime
-          pkgs.python3Packages.pyaudio
-
+          pkgs.portaudio   # pyaudio C dep
+          pkgs.sox         # useful for inspecting recorded wavs
+          pkgs.ffmpeg      # augmentation / format conversion
+          pkgs.docker      # for the CoreWorxLab docker compose path
+          pkgs.docker-compose
+          pkgs.git
         ] ++ runtimeLibs;
 
         shellHook = ''
-          export KINECT_SHIM_SO="${kinect-shim}/lib/libkinect_shim.so"
-          export LD_LIBRARY_PATH="${libfreenect2}/lib:${kinect-shim}/lib:${pkgs.lib.makeLibraryPath runtimeLibs}:$LD_LIBRARY_PATH"
+          export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath runtimeLibs}:$LD_LIBRARY_PATH"
 
-          if [ ! -d .venv ]; then
-            python -m venv --system-site-packages .venv
-            echo "created .venv — installing mediapipe + faster-whisper..."
-            .venv/bin/pip install -q mediapipe faster-whisper
+          if [ ! -d .venv-trainer ]; then
+            echo "creating trainer venv..."
+            python -m venv --system-site-packages .venv-trainer
+            echo "installing openwakeword + training deps..."
+            .venv-trainer/bin/pip install -q \
+              openwakeword \
+              onnxruntime \
+              scipy \
+              tqdm \
+              pyyaml
+            echo ""
+            echo "  to use your RX 6900 XT for training (skips docker):"
+            echo "  .venv-trainer/bin/pip install torch torchvision torchaudio \\"
+            echo "    --index-url https://download.pytorch.org/whl/rocm6.1"
           fi
-          source .venv/bin/activate
+          source .venv-trainer/bin/activate
 
-          echo "kinect dev shell ready"
-          echo "shim: $KINECT_SHIM_SO"
+          # clone CoreWorxLab training repo if not present
+          if [ ! -d openwakeword-training ]; then
+            echo "cloning CoreWorxLab/openwakeword-training..."
+            git clone --quiet https://github.com/CoreWorxLab/openwakeword-training.git
+          fi
+
+          echo ""
+          echo "wakeword trainer shell ready"
+          echo ""
+          echo "  1. record samples:    python trainer.py"
+          echo "     open http://<your-ip>:5002 on your phone"
+          echo ""
+          echo "  2a. train (docker/CPU, 6-8h per word):"
+          echo "      cd openwakeword-training && docker compose build trainer"
+          echo "      cp ../wakeword_samples/hey_zane/positive/*.wav data/hey_zane/positive/"
+          echo "      cp ../wakeword_samples/zane_write/positive/*.wav data/zane_write/positive/"
+          echo '      docker compose run --rm trainer python train.py --wake-word "hey zane"'
+          echo '      docker compose run --rm trainer python train.py --wake-word "zane write"'
+          echo ""
+          echo "  2b. train (ROCm/GPU, faster — install torch-rocm first, see above):"
+          echo "      cd openwakeword-training"
+          echo '      python train.py --wake-word "hey zane"'
+          echo '      python train.py --wake-word "zane write"'
+          echo ""
+          echo "  3. test: python test_model.py --model my_custom_model/hey_zane.onnx"
+          echo ""
         '';
-      };
-    };
+        };  # trainer
+      };    # devShells.${system}
+    };      # outputs
 }

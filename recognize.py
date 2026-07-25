@@ -35,6 +35,7 @@ import sys
 sys.path.insert(0, ".")
 from kinect import Kinect
 from pose import PoseTracker, associate_faces_to_bodies
+from hands import _is_dark, _ir_to_detection_image
 
 # cosine similarity below this = "known=False" but still returned
 CONFIDENCE_THRESHOLD = 0.45
@@ -150,9 +151,14 @@ class Recognizer:
             "body":       dict | None,   # PoseTracker body dict
         }
         """
+        self._ensure_pose_tracker()
         bgr = rgb_frame[:, :, :3]
 
-        faces_raw = self._face_app.get(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        use_ir = ir_frame is not None and _is_dark(rgb_frame)
+        detect_img = _ir_to_detection_image(ir_frame) if use_ir \
+                     else cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+        faces_raw = self._face_app.get(detect_img)
         if not faces_raw:
             return []
 
@@ -187,6 +193,7 @@ class Recognizer:
                 "bbox":       face["bbox"],
                 "embedding":  emb,
                 "body":       body,
+                "source":     "ir" if use_ir else "rgb",
             })
 
         return results
@@ -203,7 +210,8 @@ class Recognizer:
             self._pose_tracker = None
 
     # allow use without context manager (no pose tracking)
-    def __init_pose(self):
+    # _pose_tracker is always initialized; None = no pose tracking
+    def _ensure_pose_tracker(self):
         if not hasattr(self, "_pose_tracker"):
             self._pose_tracker = None
 
@@ -241,7 +249,8 @@ def draw_results(bgr: np.ndarray, results: list[dict]) -> np.ndarray:
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 3)
 
         # name + confidence — above bbox
-        name_label = f"{'✓' if r['known'] else '?'}  {r['name']}  ({r['confidence']:.3f})"
+        src_tag = f" [{r.get('source', 'rgb')}]"
+        name_label = f"{'✓' if r['known'] else '?'}  {r['name']}  ({r['confidence']:.3f}){src_tag}"
         cv2.putText(out, name_label, (x1, y1 - 36), FONT, 0.9, color, 2, cv2.LINE_AA)
 
         # bbox size + known badge — below name
