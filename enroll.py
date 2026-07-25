@@ -26,7 +26,7 @@ GRID_ROWS = 5   # Z positions: near → far (expanded by 2 rows)
 
 # depth thresholds (mm) for Z buckets — tune to your space
 # 5 rows total: closer steps added at the front, further steps pushed back
-Z_THRESHOLDS = [0, 800, 1200, 1800, 2400, 9999]   # len = GRID_ROWS + 1
+Z_THRESHOLDS = [0, 1200, 1800, 2600, 3400, 9999]   # len = GRID_ROWS + 1
 
 # X thresholds as fraction of frame width (0.0 = left, 1.0 = right)
 X_FRACTIONS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]  # len = GRID_COLS + 1
