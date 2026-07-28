@@ -1,0 +1,232 @@
+:root {
+  --bg:      #0b0b0e;
+  --surface: #15151a;
+  --border:  #2a2a30;
+  --text:    #e8e8ec;
+  --muted:   #6b6b76;
+  --green:   #3ddc84;
+  --amber:   #f0b429;
+  --blue:    #4a9eff;
+  --red:     #ff5c5c;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'SF Mono', 'Fira Mono', monospace;
+}
+
+body {
+  display: flex;
+  flex-direction: row;
+}
+
+/* ── stage: camera feed + skeleton overlay + test button + cursors ── */
+
+#stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  background: #000;
+  overflow: hidden;
+}
+
+#feed, #overlay {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  object-fit: contain;
+}
+
+#overlay { pointer-events: none; }
+
+#cursors {
+  position: fixed;   /* viewport space, matches gesture x/y and elementFromPoint — see index.html */
+  inset: 0;
+  pointer-events: none;
+  z-index: 1000;
+}
+
+.cursor-dot {
+  position: fixed;
+  width: 22px; height: 22px;
+  margin-left: -11px; margin-top: -11px;
+  border-radius: 50%;
+  border: 2px solid var(--green);
+  background: rgba(61, 220, 132, 0.15);
+  transition: left .04s linear, top .04s linear, background .1s, border-color .1s;
+}
+
+.cursor-dot.right { border-color: var(--blue); background: rgba(74, 158, 255, 0.15); }
+.cursor-dot.grabbing { background: var(--amber); border-color: var(--amber); }
+
+.test-btn {
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  width: 260px; height: 260px;
+  border-radius: 20px;
+  border: 2px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: .05em;
+  cursor: pointer;
+  transition: background .12s, border-color .12s, transform .08s;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.test-btn span {
+  font-size: .7rem;
+  font-weight: 400;
+  color: var(--muted);
+  letter-spacing: normal;
+}
+
+/* .nkit-hover mirrors :hover — real :hover never fires for synthetic
+   pointer events, this class is toggled manually by app.js instead */
+.test-btn:hover, .test-btn.nkit-hover { border-color: var(--blue); background: #102030; }
+.test-btn:active,
+.test-btn.pressed { transform: translate(-50%, -50%) scale(.96); border-color: var(--green); background: #1a2e1f; }
+
+#clickFlash {
+  position: fixed;   /* viewport space — see #cursors */
+  width: 40px; height: 40px;
+  margin-left: -20px; margin-top: -20px;
+  border-radius: 50%;
+  border: 2px solid var(--green);
+  opacity: 0;
+  pointer-events: none;
+  z-index: 1000;
+}
+
+#clickFlash.flash {
+  animation: flash-out .35s ease-out;
+}
+
+@keyframes flash-out {
+  from { opacity: 1; transform: scale(.3); }
+  to   { opacity: 0; transform: scale(2.2); }
+}
+
+/* ── sidebar ── */
+
+#sidebar {
+  flex: 0 0 340px;
+  height: 100%;
+  overflow-y: auto;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+section h2 {
+  font-size: .7rem;
+  text-transform: uppercase;
+  letter-spacing: .1em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.status {
+  display: inline-block;
+  font-size: .75rem;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 5px;
+  margin-bottom: 8px;
+}
+
+.status.connected    { background: #1a2e1f; color: var(--green); }
+.status.disconnected { background: #2e1a1a; color: var(--red); }
+
+#quitBtn {
+  display: block;
+  width: 100%;
+  padding: 8px;
+  background: var(--bg);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: .75rem;
+  cursor: pointer;
+}
+#quitBtn:hover { color: var(--red); border-color: var(--red); }
+
+.empty { color: var(--muted); font-size: .75rem; }
+
+.person-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  font-size: .75rem;
+}
+
+.person-card .name { font-weight: 700; }
+.person-card .name.known { color: var(--green); }
+.person-card .name.unknown { color: var(--muted); }
+.person-card .hand-row { display: flex; justify-content: space-between; color: var(--muted); margin-top: 4px; }
+.person-card .hand-row .fist { color: var(--amber); }
+.person-card .hand-row .palm { color: var(--blue); }
+
+#voiceStatus {
+  font-size: .75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+#voiceStatus .mode { font-weight: 700; color: var(--amber); }
+
+#gestureLog {
+  height: 160px;
+  overflow-y: auto;
+  font-size: .68rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column-reverse;
+}
+
+#gestureLog .entry { color: var(--muted); padding: 1px 0; white-space: nowrap; }
+#gestureLog .entry .kind { color: var(--text); font-weight: 700; }
+#gestureLog .entry.push .kind      { color: var(--green); }
+#gestureLog .entry.grab_start .kind,
+#gestureLog .entry.grab_end .kind  { color: var(--amber); }
+#gestureLog .entry.swipe_edge .kind,
+#gestureLog .entry.grab_swipe .kind { color: var(--blue); }
+
+.slider-row { margin-bottom: 10px; }
+.slider-row label {
+  display: flex;
+  justify-content: space-between;
+  font-size: .68rem;
+  color: var(--muted);
+  margin-bottom: 3px;
+}
+.slider-row label .val { color: var(--text); }
+.slider-row input[type="range"] { width: 100%; }
+
+.persist-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: .7rem;
+  color: var(--muted);
+  margin-top: 6px;
+}

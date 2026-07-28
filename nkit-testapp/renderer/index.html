@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>nkit testapp</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="feed" width="1920" height="1080"></canvas>
+  <canvas id="overlay" width="1920" height="1080"></canvas>
+  <button id="testBtn" class="test-btn">
+    TEST BUTTON
+    <span>hover / grab / click me</span>
+  </button>
+</div>
+
+<!-- viewport-fixed, NOT nested in #stage: gesture x/y are real window
+     coordinates (same space elementFromPoint uses), and #stage doesn't
+     span the full window (the sidebar eats the right edge) — nesting these
+     inside it would silently misalign the cursor from where a click
+     actually lands. -->
+<div id="cursors"></div>
+<div id="clickFlash"></div>
+
+<aside id="sidebar">
+  <section>
+    <h2>nkit bridge</h2>
+    <div id="connStatus" class="status disconnected">disconnected</div>
+    <button id="quitBtn">Quit</button>
+  </section>
+
+  <section>
+    <h2>Tracking</h2>
+    <label class="persist-row">
+      <input type="checkbox" id="bodyToggle" checked> full skeleton (off = hands + head only)
+    </label>
+    <label class="persist-row">
+      <input type="checkbox" id="irToggle" checked> prefer IR for hand detection
+    </label>
+  </section>
+
+  <section>
+    <h2>People</h2>
+    <div id="peopleList" class="empty">no skeletons tracked</div>
+  </section>
+
+  <section>
+    <h2>Voice</h2>
+    <div id="voiceStatus" class="empty">no wake word detected yet</div>
+  </section>
+
+  <section>
+    <h2>Gesture log</h2>
+    <div id="gestureLog"></div>
+  </section>
+
+  <section>
+    <h2>Gesture thresholds</h2>
+    <div id="sliders"></div>
+    <label class="persist-row">
+      <input type="checkbox" id="persistToggle"> save changes to disk
+    </label>
+  </section>
+</aside>
+
+<script src="app.js"></script>
+</body>
+</html>
