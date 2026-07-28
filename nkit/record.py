@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import json
 import os
 import queue
@@ -45,33 +46,33 @@ import websockets
 
 from .kinect import Kinect, ThreadedKinect
 
-# The first three are NEGATIVES, and they matter as much as the gestures.
-# The loudest complaint is push firing when nobody pushed, and a threshold (or
-# a classifier) can only be checked against that if the data contains the
-# motions that falsely trigger it. Each negative is aimed at a specific
-# false positive:
+# Buttons are MOMENTARY MARKS, not a sticky state: tap one at the instant you
+# do the thing and it records a timestamp. Everything unmarked is implicitly
+# rest, which is why there's no rest button.
 #
-#   rest          arms down, still — the trivial case
-#   moving        natural non-gesture motion: shifting weight, walking, talking
-#                 with your hands, scratching your face. Catch-all negative.
-#   reach_forward reaching for a drink/keyboard. Hand travels toward the camera
-#                 and the arm extends, which is exactly what push measures —
-#                 the hardest negative for push, and probably the actual cause.
-#   wave          lateral hand motion that must NOT read as a page swipe; the
-#                 same shape swipe_left/right look for, minus the intent.
+# This replaced a sticky per-frame label, for two reasons. First, a sticky
+# label has to be toggled back, and forgetting to do that silently mislabels
+# everything after it (it happened twice, in both directions). Second and more
+# importantly, it produced takes that were ~100% gesture — a push take was a
+# median of 13 frames, 0.4s, all push. A live detector's whole job is finding
+# a gesture inside a stream that is mostly not-gesture, and pre-segmented
+# clips contain no "before" or "after" to learn the onset from. Marks let you
+# record minutes of ordinary activity with gestures sprinkled through it,
+# which is what deployment actually looks like.
 #
-# Recording only gestures would tell us nothing about any of these.
+# reach_forward and moving are still listed because they're the hard
+# negatives: reaching for a drink extends the arm toward the camera exactly
+# like a push does, and it's the likeliest source of false fires.
 ACTIONS = [
-    "rest",
-    "moving",
-    "reach_forward",
-    "wave",
     "push",
     "swipe_left",
     "swipe_right",
     "fist",
     "grab_swipe_up",
     "grab_swipe_down",
+    "wave",
+    "reach_forward",
+    "moving",
 ]
 
 # recorded alongside every frame so one session can cover several conditions
@@ -106,6 +107,8 @@ class Recorder:
         self.session_dir: str | None = None
         self.frame_count = 0
         self._manifest = None
+        self._marks = None
+        self.mark_counts: collections.Counter = collections.Counter()
 
     def start_session(self, meta: dict) -> str:
         name = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -114,6 +117,11 @@ class Recorder:
         with open(os.path.join(self.session_dir, "session.json"), "w") as f:
             json.dump({"started": name, **meta}, f, indent=2)
         self._manifest = open(os.path.join(self.session_dir, "manifest.jsonl"), "a")
+        # marks live in their own file rather than as a per-frame column: a
+        # mark is an instant, and how wide a window around it counts as the
+        # gesture is an analysis decision, not something to bake in at capture
+        self._marks = open(os.path.join(self.session_dir, "marks.jsonl"), "a")
+        self.mark_counts.clear()
         self.frame_count = 0
 
         self._stop.clear()
@@ -125,15 +133,24 @@ class Recorder:
         self._q.put((rgb, depth, ir, meta))
         self.frame_count += 1
 
+    def mark(self, action: str, t: float) -> None:
+        """Record that `action` happened at wall-clock time t."""
+        if self._marks is None:
+            return
+        self._marks.write(json.dumps({"t": t, "action": action}) + "\n")
+        self._marks.flush()        # a crash mid-take shouldn't lose the labels
+        self.mark_counts[action] += 1
+
     def stop_session(self) -> None:
         self._stop.set()
         self._q.put(None)                     # wake the writer out of its get()
         if self._thread:
             self._thread.join(timeout=15.0)   # let the backlog flush
             self._thread = None
-        if self._manifest:
-            self._manifest.close()
-            self._manifest = None
+        for f in ("_manifest", "_marks"):
+            if getattr(self, f):
+                getattr(self, f).close()
+                setattr(self, f, None)
 
     def _run(self) -> None:
         while True:
@@ -169,9 +186,9 @@ class RecordServer:
 
         self.recorder = Recorder(out_root)
         self.recording = False
-        self.action = "rest"
         self.position = "desk"
         self.lighting = "light"
+        self.last_mark: tuple[str, float] | None = None   # for UI feedback only
 
         self._clients: set = set()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -197,10 +214,11 @@ class RecordServer:
 
                 with self._status_lock:
                     recording = self.recording
+                    # no action here — labels come from marks.jsonl, matched
+                    # to frames by timestamp at analysis time
                     meta = {
                         "i": self.recorder.frame_count,
                         "t": time.time(),
-                        "action": self.action,
                         "position": self.position,
                         "lighting": self.lighting,
                     }
@@ -226,14 +244,18 @@ class RecordServer:
 
     def _status(self) -> dict:
         with self._status_lock:
+            lm, lt = self.last_mark or (None, 0.0)
             return {
                 "type": "status",
                 "recording": self.recording,
-                "action": self.action,
                 "position": self.position,
                 "lighting": self.lighting,
                 "frames": self.recorder.frame_count,
                 "session": os.path.basename(self.recorder.session_dir or ""),
+                "marks": dict(self.recorder.mark_counts),
+                "total_marks": sum(self.recorder.mark_counts.values()),
+                "last_mark": lm,
+                "last_mark_age": max(0.0, time.time() - lt) if lm else None,
                 "actions": ACTIONS, "positions": POSITIONS, "lightings": LIGHTING,
             }
 
@@ -274,10 +296,18 @@ class RecordServer:
 
     def _on_message(self, msg: dict) -> None:
         kind = msg.get("type")
-        if kind == "set":
+        if kind == "mark":
+            action = msg.get("action")
+            if action in ACTIONS and self.recording:
+                # stamp on arrival: the phone's clock isn't the capture clock,
+                # and wifi latency is far smaller than the window any analysis
+                # will put around a mark
+                t = time.time()
+                self.recorder.mark(action, t)
+                with self._status_lock:
+                    self.last_mark = (action, t)
+        elif kind == "set":
             with self._status_lock:
-                if msg.get("action") in ACTIONS:
-                    self.action = msg["action"]
                 if msg.get("position") in POSITIONS:
                     self.position = msg["position"]
                 if msg.get("lighting") in LIGHTING:
@@ -291,8 +321,9 @@ class RecordServer:
         elif kind == "stop" and self.recording:
             with self._status_lock:
                 self.recording = False
+            marks = dict(self.recorder.mark_counts)
             self.recorder.stop_session()
-            print(f"[record] stopped ({self.recorder.frame_count} frames)")
+            print(f"[record] stopped ({self.recorder.frame_count} frames, marks: {marks or 'none'})")
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -367,17 +398,24 @@ _PAGE = """<!doctype html>
   button { flex:1 1 auto; min-width:30%; padding:16px 10px; font-size:15px; border-radius:10px;
            border:1px solid #333; background:#1c1c1c; color:#ddd; }
   button.on { background:#2d6cdf; border-color:#2d6cdf; color:#fff; font-weight:600; }
+  #acts button { min-width:47%; padding:20px 8px; font-weight:600; position:relative; }
+  #acts button.flash { background:#2d6cdf; border-color:#8ab4ff; transform:scale(.97); }
+  #acts button:disabled { opacity:.35; }
+  .cnt { display:inline-block; margin-left:6px; font-size:12px; color:#8ab4ff; font-weight:400; }
   #rec { width:100%; padding:22px; font-size:19px; font-weight:700; margin-top:14px; }
   #rec.live { background:#c62828; border-color:#c62828; color:#fff; }
   #st { margin-top:10px; font-size:13px; color:#999; text-align:center; }
-  .big { display:block; text-align:center; font-size:26px; font-weight:700; color:#fff; margin:10px 0 2px; }
+  .big { display:block; text-align:center; font-size:22px; font-weight:700; color:#fff; margin:10px 0 2px; min-height:28px; }
+  .hint { font-size:12px; color:#777; text-align:center; margin:6px 0 0; }
 </style></head><body>
 
 <img id="v" alt="camera preview">
-<span class="big" id="cur">rest</span>
+<span class="big" id="cur">—</span>
 <div id="st">connecting…</div>
+<p class="hint">Record continuously. Tap a button at the moment you do the gesture —
+everything unmarked counts as rest.</p>
 
-<h2>Action</h2><div class="row" id="acts"></div>
+<h2>Mark a gesture</h2><div class="row" id="acts"></div>
 <h2>Position</h2><div class="row" id="poss"></div>
 <h2>Lighting</h2><div class="row" id="lits"></div>
 <button id="rec">● START RECORDING</button>
@@ -396,10 +434,12 @@ ws.onmessage = (e) => {
   }
   S = JSON.parse(e.data);
   if (S.type !== "status") return;
-  paint("acts", S.actions,   S.action,   (v)=>({action:v}));
+  marks(S.actions, S.marks || {}, S.recording);
   paint("poss", S.positions, S.position, (v)=>({position:v}));
   paint("lits", S.lightings, S.lighting, (v)=>({lighting:v}));
-  document.getElementById("cur").textContent = S.action;
+  document.getElementById("cur").textContent =
+    (S.last_mark && S.last_mark_age < 1.5) ? "✓ " + S.last_mark.replace(/_/g," ")
+    : (S.recording ? `${S.total_marks} marks` : "—");
   const r = document.getElementById("rec");
   r.className = S.recording ? "live" : "";
   r.textContent = S.recording ? "■ STOP RECORDING" : "● START RECORDING";
@@ -408,9 +448,33 @@ ws.onmessage = (e) => {
 };
 ws.onclose = () => document.getElementById("st").textContent = "disconnected";
 
+function marks(opts, counts, live) {
+  const el = document.getElementById("acts");
+  if (el.dataset.n != opts.length) {
+    el.innerHTML = "";
+    for (const o of opts) {
+      const b = document.createElement("button");
+      b.dataset.v = o;
+      b.onclick = () => {
+        ws.send(JSON.stringify({type:"mark", action:o}));
+        b.classList.add("flash");                     // instant local feedback,
+        setTimeout(()=>b.classList.remove("flash"), 160);  // don't wait for the server
+        if (navigator.vibrate) navigator.vibrate(25); // so you can mark without looking
+      };
+      el.appendChild(b);
+    }
+    el.dataset.n = opts.length;
+  }
+  for (const b of el.children) {
+    const c = counts[b.dataset.v] || 0;
+    b.innerHTML = b.dataset.v.replace(/_/g," ") + (c ? `<span class="cnt">${c}</span>` : "");
+    b.disabled = !live;
+  }
+}
+
 function paint(id, opts, cur, mk) {
   const el = document.getElementById(id);
-  if (el.dataset.n != opts.length) {                  // build once, then just restyle
+  if (el.dataset.n != opts.length) {
     el.innerHTML = "";
     for (const o of opts) {
       const b = document.createElement("button");

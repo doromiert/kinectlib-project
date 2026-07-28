@@ -35,6 +35,41 @@ def manifest(session: str | Path) -> list[dict]:
         return [json.loads(l) for l in f if l.strip()]
 
 
+def marks(session: str | Path) -> list[dict]:
+    """
+    Gesture marks for a session: [{"t": ..., "action": ...}, ...].
+
+    Empty for sessions recorded before marks existed — those carry a sticky
+    per-frame "action" in the manifest instead.
+    """
+    p = Path(session) / "marks.jsonl"
+    if not p.exists():
+        return []
+    with open(p) as f:
+        return [json.loads(l) for l in f if l.strip()]
+
+
+def label_frames(session: str | Path, window_s: float = 0.4) -> dict[int, str]:
+    """
+    frame index -> action, for frames within window_s of a mark. Frames absent
+    from the result are rest.
+
+    window_s is an analysis choice, not a recorded one — a mark is an instant,
+    and how much of the motion around it counts as the gesture is exactly the
+    thing worth varying when tuning a detector.
+    """
+    ms = marks(session)
+    if not ms:
+        return {}
+    out: dict[int, str] = {}
+    for m in manifest(session):
+        for k in ms:
+            if abs(m["t"] - k["t"]) <= window_s:
+                out[m["i"]] = k["action"]
+                break
+    return out
+
+
 def frames(session: str | Path) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, dict]]:
     """
     Yields (rgb, depth, ir, meta) in recorded order.
