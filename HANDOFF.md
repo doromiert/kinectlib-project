@@ -103,14 +103,25 @@ space. Cropping to the person fills that 256px at any range. Measured crop:
 
 ### Push detection
 
-Current implementation (`gestures.py:_update_push_travel`) requires forward
-travel (`push_travel_mm`, 200mm) **and** speed (`push_min_velocity`,
-450mm/s), measured body-relative so it's distance-invariant. Streams
-`push_progress` 0.0–1.0 for the UI ring, `push_cancel` on abort.
+Current implementation is `gestures.py:_update_push_hand` — **the hand
+alone, no body reference**. Two quantities: speed toward the camera
+(`push_min_velocity`, 450mm/s) and travel from where the motion started
+(`push_travel_mm`, 200mm). Origin is frozen at motion onset, not a drifting
+EMA baseline (the baseline could be outrun mid-gesture and ate the very
+displacement it was measuring). Streams `push_progress` 0.0–1.0 for the UI
+ring, `push_cancel` on abort.
 
-**Unvalidated live.** Last user feedback on the previous iteration was "feels
-the same (bad) — too unreliable/slow to react forward, too hyperactive
-backward." The dropout fix below directly targets that and has not been tried.
+Depth is already millimetres, so travel is distance-invariant without
+normalising against the torso. Dropping the torso removed a second fragile
+measurement — it needed shoulders that aren't visible seated, and every
+torso dropout became a push dropout. It now works with **no shoulders at
+all**.
+
+**Unvalidated live** — this is the version to try first. The previous
+(torso-relative) iteration drew "feels the same (bad) — too unreliable/slow
+to react forward, too hyperactive backward". `_update_push_travel` and
+`_update_push_reach` are the superseded versions, still present as
+fallbacks.
 
 Features measured and **rejected** (don't retry these):
 
@@ -221,8 +232,10 @@ Full re-extraction over ~4000 frames takes ~2 min.
 
 ## Suggested next steps
 
-1. **Try the current push live.** The dropout fix is the best-grounded change
-   yet and is untested.
+1. **Try the current push live** (`_update_push_hand`, hand-only). Untested
+   on real hands. Tune `push_min_velocity` first, then `push_travel_mm`, and
+   watch how far the ring fills during ordinary activity — that gap is the
+   real margin and no recording could show it.
 2. **If it still fails**, switch the proximity cue from point-depth to hand
    *area* (see above) rather than tuning thresholds again.
 3. **Diagnose swipe.** Cheapest open win — it's a bug, not a tuning problem.
