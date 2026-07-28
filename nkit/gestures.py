@@ -122,6 +122,7 @@ class _HandState:
     # manufacture a spike
     push_fwd_hist:     list = field(default_factory=list)
     push_fwd_last_ts:  float | None = None   # when we last had usable hand depth
+    push_origin_z:     float | None = None   # point A, frozen at motion onset
 
     # swipe from edge
     swipe_edge_name:   str | None = None
@@ -220,6 +221,66 @@ class GestureTracker:
         if torso_z is None:
             return None
         return torso_z - wrist.z
+
+    def _update_push_hand(
+        self, state: _HandState, z_mm: float, timestamp: float, config: GestureConfig,
+    ) -> tuple[bool, float | None, bool]:
+        """
+        Push from the hand's own trajectory alone. Returns
+        (fired, progress_or_None, cancelled).
+
+        Two quantities, both about the hand and nothing else:
+          1. speed  — is it moving toward the camera, fast enough to be meant
+          2. travel — how far it has come from where the motion STARTED
+
+        No body reference. Depth is already millimetres, so travel is
+        distance-invariant without normalising against the torso, and dropping
+        the torso removes a whole second measurement that could fail — it was
+        requiring shoulders that aren't visible when seated, and every torso
+        dropout became a push dropout.
+
+        Origin is captured at motion ONSET and then frozen. The previous
+        version measured against a slowly-drifting EMA baseline, which a push
+        could outrun: the baseline crept toward the hand mid-gesture and ate
+        the very displacement being measured. A frozen point A can't do that,
+        and "distance from A to B" is what a push actually is.
+        """
+        hist = state.push_fwd_hist
+        velocity = _forward_velocity(hist)      # +ve = toward the camera
+
+        if not state.push_armed:
+            if velocity < config.push_min_velocity:
+                return False, None, False
+            # freeze point A at the oldest sample still in the window — the
+            # motion began there, not at the frame we happened to notice it
+            state.push_origin_z = hist[0][1] if hist else z_mm
+            state.push_armed = True
+            state.push_peak_travel = 0.0
+            state.push_phase_start_ts = timestamp
+
+        # z_mm arrives already negated (+ve = toward the camera), so travel is
+        # current minus origin, not the other way round
+        travel = z_mm - (state.push_origin_z if state.push_origin_z is not None else z_mm)
+        state.push_peak_travel = max(state.push_peak_travel, travel)
+        progress = _clip(travel / max(1.0, config.push_travel_mm), 0.0, 1.0)
+
+        if (timestamp - (state.push_phase_start_ts or timestamp)) * 1000.0 > config.push_window_ms:
+            state.push_armed = False
+            return False, None, True
+
+        if travel >= config.push_travel_mm:
+            state.push_armed = False
+            if (timestamp - state.last_push_ts) * 1000.0 >= config.push_debounce_ms:
+                state.last_push_ts = timestamp
+                return True, 1.0, False
+            return False, None, True
+
+        # gave up on the way out — hand reversed before completing
+        if travel < state.push_peak_travel - config.push_arm_mm:
+            state.push_armed = False
+            return False, None, True
+
+        return False, progress, False
 
     def _update_push_travel(
         self, state: _HandState, forward_mm: float, timestamp: float, config: GestureConfig,
@@ -559,9 +620,11 @@ class GestureTracker:
                 fwd = None
                 if body is not None:
                     # the pose model's own wrist, not the hand model's — see
-                    # _reach's note on not mixing the two networks' estimates
+                    # _reach's note on not mixing the two networks' estimates.
+                    # Raw depth, no torso reference: see _update_push_hand.
                     pose_wrist = body.left_wrist if hand.side == "left" else body.right_wrist
-                    fwd = self._forward_mm(body, pose_wrist)
+                    if pose_wrist.z > 0:
+                        fwd = pose_wrist.z
                 if fwd is None and state.push_armed and \
                         timestamp - (state.push_fwd_last_ts or 0.0) <= PUSH_HOLD_THROUGH_DROPOUT_S:
                     # mid-push dropout: hold the armed state and keep the ring
@@ -574,7 +637,14 @@ class GestureTracker:
                         progress=_clip(state.push_peak_travel / max(1.0, config.push_travel_mm), 0.0, 1.0),
                     ))
                 elif fwd is not None:
-                    pushed, progress, cancelled = self._update_push_travel(state, fwd, timestamp, config)
+                    gap = timestamp - (state.push_fwd_last_ts or timestamp)
+                    if gap > PUSH_MAX_SAMPLE_GAP_S:
+                        state.push_fwd_hist.clear()
+                    state.push_fwd_last_ts = timestamp
+                    # store as +ve-toward-camera so velocity reads naturally
+                    state.push_fwd_hist.append((timestamp, -fwd))
+                    del state.push_fwd_hist[:-5]
+                    pushed, progress, cancelled = self._update_push_hand(state, -fwd, timestamp, config)
                     if progress is not None and not pushed:
                         events.append(GestureEvent(
                             skeleton_id=hand.skeleton_id, side=hand.side, kind="push_progress",
