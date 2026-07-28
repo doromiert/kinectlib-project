@@ -18,6 +18,7 @@
         libGL
         libGLU
         pkg-config
+        speexdsp   # nkit/audio/aec.py — ctypes AEC binding needs libspeexdsp.so on LD_LIBRARY_PATH
       ];
 
       libfreenect2 = pkgs.stdenv.mkDerivation rec {
@@ -90,6 +91,45 @@
         opencv4
       ]);
 
+      # nix run .#record-server — phone-controlled gesture capture rig
+      # (nkit/record.py). Runs out of the devShell's .venv rather than a
+      # self-contained python env: importing nkit pulls in mediapipe, which
+      # isn't in nixpkgs and is pip-installed by the default shell's hook.
+      record-server = pkgs.writeShellApplication {
+        name = "record-server";
+        text = ''
+          export KINECT_SHIM_SO="${kinect-shim}/lib/libkinect_shim.so"
+          # glib on top of runtimeLibs: the venv's cv2 is pip's opencv-python,
+          # which dlopens libgthread-2.0. `nix develop` pulls it in incidentally
+          # through mkShell's stdenv, so it only shows up as missing out here.
+          export LD_LIBRARY_PATH="${libfreenect2}/lib:${kinect-shim}/lib:${pkgs.lib.makeLibraryPath (runtimeLibs ++ [ pkgs.glib ])}:''${LD_LIBRARY_PATH:-}"
+
+          # Walk up to the repo root instead of trusting $PWD: nix resolves the
+          # flake by searching upward, so `nix run .#record-server` works from
+          # any subdirectory — but the script's cwd stays where you invoked it,
+          # and a bare `.venv` then picks up whatever venv happens to be there
+          # (nkit-testapp/ has its own).
+          root="$PWD"
+          while [ "$root" != "/" ] && [ ! -f "$root/nkit/record.py" ]; do
+            root="$(dirname "$root")"
+          done
+          if [ ! -f "$root/nkit/record.py" ]; then
+            echo "record-server: couldn't find the nkit repo above $PWD" >&2
+            exit 1
+          fi
+          cd "$root"
+
+          if [ ! -x .venv/bin/python ]; then
+            echo "record-server: no .venv in $root" >&2
+            echo "  run 'nix develop' once in the repo root to create it, then retry." >&2
+            exit 1
+          fi
+
+          # relative --out paths resolve against the repo root, not your cwd
+          exec .venv/bin/python -u -m nkit.record "$@"
+        '';
+      };
+
       # openwakeword isn't in nixpkgs, install via pip into the venv
       # listed here just so the comment is near the shell that uses it
       trainerPythonEnv = pkgs.python3.withPackages (ps: with ps; [
@@ -101,13 +141,21 @@
     in
     {
       packages.${system} = {
-        inherit libfreenect2 kinect-shim;
+        inherit libfreenect2 kinect-shim record-server;
         default = libfreenect2;
       };
 
-      apps.${system}.default = {
-        type    = "app";
-        program = "${libfreenect2}/bin/Protonect";
+      apps.${system} = {
+        default = {
+          type    = "app";
+          program = "${libfreenect2}/bin/Protonect";
+        };
+
+        # nix run .#record-server -- --out recordings/
+        record-server = {
+          type    = "app";
+          program = "${record-server}/bin/record-server";
+        };
       };
 
       devShells.${system} = {
@@ -124,6 +172,10 @@
             pkgs.python3Packages.insightface
             pkgs.python3Packages.onnxruntime
             pkgs.python3Packages.pyaudio
+            pkgs.nodejs    # nkit-testapp/ (Electron demo UI) — npm/node for deps
+            pkgs.electron  # run the app via THIS electron, not the npm-fetched one —
+                            # npm's prebuilt Electron binary isn't patched for NixOS's
+                            # dynamic linker layout and won't run as-is. see nkit-testapp/README.
 
           ] ++ runtimeLibs;
 
@@ -133,10 +185,17 @@
 
             if [ ! -d .venv ]; then
               python -m venv --system-site-packages .venv
-              echo "created .venv — installing mediapipe + faster-whisper..."
-              .venv/bin/pip install -q mediapipe faster-whisper
+              echo "created .venv"
             fi
+            # always ensure these are present, not just on first .venv creation —
+            # an existing .venv from before a dep was added here would otherwise
+            # silently never pick it up
+            .venv/bin/pip install -q mediapipe faster-whisper openwakeword websockets
             source .venv/bin/activate
+
+            if [ ! -d nkit-testapp/node_modules ]; then
+              echo "nkit-testapp/node_modules missing — run 'npm install' inside nkit-testapp/ to fetch Electron"
+            fi
 
             echo "kinect dev shell ready"
             echo "shim: $KINECT_SHIM_SO"

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nkit"
+version = "0.1.0"
+description = "Negative Zero Kinect Interface Toolkit — skeleton/hand/face tracking, gestures, and voice for the Kinect v2"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "mediapipe",
+    # insightface, onnxruntime, pyaudio are provided by the nix devShell
+    # (pkgs.python3Packages.*) rather than pip — see flake.nix.
+    "faster-whisper",
+    "openwakeword",
+    "websockets",
+]
+
+[project.optional-dependencies]
+demo = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["nkit"]

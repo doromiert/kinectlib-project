@@ -1,3 +1,8 @@
 *.png
 wakeword_samples
 enroll
+recordings
+.venv
+.venv-trainer
+__pycache__/
+.venv
