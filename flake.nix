@@ -92,17 +92,21 @@
       ]);
 
       # nix run .#record-server — phone-controlled gesture capture rig
-      # (nkit/record.py). Runs out of the devShell's .venv rather than a
-      # self-contained python env: importing nkit pulls in mediapipe, which
-      # isn't in nixpkgs and is pip-installed by the default shell's hook.
+      # (nkit/record.py). Fully nixpkgs-native, no venv: record.py does no
+      # detection, so it needs only cv2 + numpy + websockets, and nkit's
+      # __init__ imports lazily so pulling in nkit.record doesn't drag
+      # mediapipe (not in nixpkgs) along with it.
+      recordPythonEnv = pkgs.python3.withPackages (ps: with ps; [
+        numpy
+        opencv4
+        websockets
+      ]);
+
       record-server = pkgs.writeShellApplication {
         name = "record-server";
         text = ''
           export KINECT_SHIM_SO="${kinect-shim}/lib/libkinect_shim.so"
-          # glib on top of runtimeLibs: the venv's cv2 is pip's opencv-python,
-          # which dlopens libgthread-2.0. `nix develop` pulls it in incidentally
-          # through mkShell's stdenv, so it only shows up as missing out here.
-          export LD_LIBRARY_PATH="${libfreenect2}/lib:${kinect-shim}/lib:${pkgs.lib.makeLibraryPath (runtimeLibs ++ [ pkgs.glib ])}:''${LD_LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="${libfreenect2}/lib:${kinect-shim}/lib:${pkgs.lib.makeLibraryPath runtimeLibs}:''${LD_LIBRARY_PATH:-}"
 
           # Walk up to the repo root instead of trusting $PWD: nix resolves the
           # flake by searching upward, so `nix run .#record-server` works from
@@ -119,14 +123,9 @@
           fi
           cd "$root"
 
-          if [ ! -x .venv/bin/python ]; then
-            echo "record-server: no .venv in $root" >&2
-            echo "  run 'nix develop' once in the repo root to create it, then retry." >&2
-            exit 1
-          fi
-
-          # relative --out paths resolve against the repo root, not your cwd
-          exec .venv/bin/python -u -m nkit.record "$@"
+          # relative --out paths resolve against the repo root, not your cwd.
+          # cwd is on sys.path for `python -m`, which is how nkit/ is found.
+          exec ${recordPythonEnv}/bin/python -u -m nkit.record "$@"
         '';
       };
 
