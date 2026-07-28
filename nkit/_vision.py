@@ -472,12 +472,61 @@ def pixel_delta_to_mm(dx_px: float, dy_px: float, z_mm: float) -> tuple[float, f
     return dx_px * z_mm / RGB_FOCAL_PX_X, dy_px * z_mm / RGB_FOCAL_PX_Y
 
 
-def depth_at(depth: np.ndarray, x: int, y: int, radius: int = 3) -> float:
-    """Median depth in a small patch around (x, y). Returns 0.0 if no valid data."""
+# The gate is deliberately asymmetric. A hand reaches a long way IN FRONT of
+# the torso (that's most of what a gesture is) but never ends up far behind
+# it, so a symmetric window has to be wide enough for the reach and then lets
+# the wall back in. Measured: a symmetric +-600mm threw away every sample in
+# the patch on 55% of push frames — the hand is small, the patch around it is
+# mostly background, and background sat outside the window, so the gate
+# rejected the very frames the push detector depends on.
+DEPTH_GATE_FORWARD_MM = 1000.0   # arm's reach toward the camera, plus margin
+DEPTH_GATE_BEHIND_MM  = 400.0    # barely past the torso plane going away
+
+
+def depth_at(depth: np.ndarray, x: int, y: int, radius: int = 3,
+             reference: float | None = None,
+             forward_mm: float = DEPTH_GATE_FORWARD_MM,
+             behind_mm: float = DEPTH_GATE_BEHIND_MM) -> float:
+    """
+    Depth in a small patch around (x, y). Returns 0.0 if no valid data.
+
+    reference: a depth this sample is expected to be near (in practice the
+    torso — see body._torso_reference). Patch pixels outside
+    [reference - forward_mm, reference + behind_mm] are dropped before
+    averaging; smaller depth is nearer the camera, so forward_mm is the
+    generous direction.
+
+    Why the gate exists: at a limb, the patch straddles the person and
+    whatever is behind them, and once more than half of it lands on
+    background the plain median IS the background. Measured on a real
+    recording, that put 21% of frames' |shoulder->elbow| above 600mm — for a
+    bone that is ~280mm and cannot change length — with excursions to 2.6m.
+    Every gesture threshold downstream was reading that noise. Gating against
+    the torso takes it to 9%.
+
+    With no reference, falls back to a low percentile rather than the median:
+    the limb is the nearest thing in the patch, so when in doubt bias toward
+    the near surface instead of splitting the difference with the wall.
+    """
     x1 = max(0, x - radius)
     x2 = min(DEPTH_W - 1, x + radius)
     y1 = max(0, y - radius)
     y2 = min(DEPTH_H - 1, y + radius)
     patch = depth[y1:y2, x1:x2]
     valid = patch[patch > 0]
-    return float(np.median(valid)) if len(valid) > 0 else 0.0
+    if valid.size == 0:
+        return 0.0
+
+    if reference is not None:
+        on_body = valid[(valid > reference - forward_mm) & (valid < reference + behind_mm)]
+        if on_body.size > 0:
+            # low percentile, not median: even after gating, a patch at a
+            # wrist is mostly whatever is behind the hand, and the limb is
+            # the nearest thing in it
+            return float(np.percentile(on_body, 20))
+        # nothing in the patch is plausibly on the person — the landmark is
+        # off-body (occluded, or mediapipe guessing). Say so rather than
+        # returning a confident background reading.
+        return 0.0
+
+    return float(np.percentile(valid, 20))

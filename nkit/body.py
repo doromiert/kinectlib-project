@@ -153,12 +153,37 @@ def _landmarks_xy_from_result(pose_landmarks, roi: Roi) -> dict[str, Vec3]:
     return lm
 
 
+LANDMARK_DEPTH_RADIUS = 7   # wider than the ungated default; the gate does the rejecting
+
+
+def _torso_reference(landmarks: dict[str, Vec3], depth_frame: np.ndarray) -> float | None:
+    """
+    Depth of the chest, or None if it can't be read.
+
+    The point between the shoulders is the most reliable sample on a person:
+    it's broad and flat, so a patch there lands entirely on them, where a
+    patch at a wrist or elbow is half background. That makes it a good
+    reference for rejecting background bleed-through everywhere else — see
+    _vision.depth_at's `reference`.
+    """
+    ls, rs = landmarks.get("left_shoulder"), landmarks.get("right_shoulder")
+    if ls is None or rs is None:
+        return None
+    x_d = int(np.clip((ls.x + rs.x) / 2 * SCALE_X, 0, DEPTH_W - 1))
+    y_d = int(np.clip((ls.y + rs.y) / 2 * SCALE_Y, 0, DEPTH_H - 1))
+    z = depth_at(depth_frame, x_d, y_d, radius=9)
+    return z if z > 0 else None
+
+
 def _resample_z(landmarks: dict[str, Vec3], depth_frame: np.ndarray) -> dict[str, Vec3]:
+    reference = _torso_reference(landmarks, depth_frame)
     out = {}
     for name, v in landmarks.items():
         x_d = int(np.clip(v.x * SCALE_X, 0, DEPTH_W - 1))
         y_d = int(np.clip(v.y * SCALE_Y, 0, DEPTH_H - 1))
-        out[name] = Vec3(v.x, v.y, depth_at(depth_frame, x_d, y_d))
+        out[name] = Vec3(v.x, v.y, depth_at(depth_frame, x_d, y_d,
+                                            radius=LANDMARK_DEPTH_RADIUS,
+                                            reference=reference))
     return out
 
 
