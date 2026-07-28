@@ -83,6 +83,12 @@ class _HandState:
     # push, arm-relative mode — baseline is an EMA of the resting reach ratio
     push_reach_baseline: float | None = None
 
+    # push, travel mode — baseline is an EMA of the hand's resting distance
+    # in front of the torso, so slouching or stepping forward drifts out
+    push_fwd_baseline: float | None = None
+    push_peak_travel:  float = 0.0
+    push_armed:        bool = False
+
     # swipe from edge
     swipe_edge_name:   str | None = None
     swipe_origin:      tuple[int, int] | None = None
@@ -145,6 +151,81 @@ class GestureTracker:
             return None
         axis = (forearm[0] / mag, forearm[1] / mag, forearm[2] / mag)
         return reach, axis
+
+    def _forward_mm(self, arm: tuple[Vec3, Vec3, Vec3], other_shoulder: Vec3) -> float | None:
+        """
+        How far in front of the torso the hand is, in mm.
+
+        Torso depth is the midpoint of the two shoulders — the most reliable
+        depth on a person (broad and flat, so the sampling patch lands
+        entirely on them). Being body-relative, this is already
+        distance-invariant: it doesn't change when you stand further from the
+        camera, and it cancels leaning, since shoulders and hand move together.
+        """
+        shoulder, _elbow, wrist = arm
+        if shoulder.z <= 0 or other_shoulder.z <= 0 or wrist.z <= 0:
+            return None
+        torso_z = (shoulder.z + other_shoulder.z) / 2.0
+        return torso_z - wrist.z          # +ve = hand toward the camera
+
+    def _update_push_travel(
+        self, state: _HandState, forward_mm: float, timestamp: float, config: GestureConfig,
+    ) -> tuple[bool, float | None, bool]:
+        """
+        Travel-mode push. Returns (fired, progress_or_None, cancelled).
+
+        The gesture is a deliberate forward movement of the hand, measured
+        against a slow baseline of where the hand normally sits, and it
+        reports progress the whole way so the UI can show it arming.
+
+        This replaced measuring arm EXTENSION, which could not work: measured
+        on a real recording the user's push kept the arm folded, so the
+        extension ratio during a push was lower than at rest and separated
+        from its hardest negative at exactly chance. Hand travel is what
+        actually moves during a push.
+
+        Fires on the way BACK, not at peak: requiring the hand to return
+        means a hand that drifts forward and stays there (leaning in, reaching
+        for something and holding it) never completes, and it gives the user
+        the whole outward phase to see the indicator and abort.
+        """
+        if state.push_fwd_baseline is None:
+            state.push_fwd_baseline = forward_mm
+            return False, None, False
+
+        travel = forward_mm - state.push_fwd_baseline
+
+        if not state.push_armed:
+            # baseline only drifts while idle, so a slow push can't outrun it
+            state.push_fwd_baseline = state.push_fwd_baseline * 0.93 + forward_mm * 0.07
+            if travel < config.push_arm_mm:
+                return False, None, False
+            state.push_armed = True
+            state.push_peak_travel = travel
+            state.push_phase_start_ts = timestamp
+
+        state.push_peak_travel = max(state.push_peak_travel, travel)
+        progress = _clip(state.push_peak_travel / max(1.0, config.push_travel_mm), 0.0, 1.0)
+
+        if (timestamp - (state.push_phase_start_ts or timestamp)) * 1000.0 > config.push_window_ms:
+            state.push_armed = False
+            state.push_fwd_baseline = forward_mm
+            return False, None, True          # took too long — abandon, clear the UI
+
+        if state.push_peak_travel >= config.push_travel_mm and \
+                travel <= state.push_peak_travel * config.push_release_frac:
+            state.push_armed = False
+            state.push_fwd_baseline = forward_mm
+            if (timestamp - state.last_push_ts) * 1000.0 >= config.push_debounce_ms:
+                state.last_push_ts = timestamp
+                return True, 1.0, False
+            return False, None, True
+
+        if travel < config.push_arm_mm * 0.5:
+            state.push_armed = False          # pulled back before completing
+            return False, None, True
+
+        return False, progress, False
 
     def _update_push_reach(
         self, state: _HandState, reach: float, axis: tuple[float, float, float],
@@ -372,6 +453,8 @@ class GestureTracker:
                 state.push_phase = "idle"
                 state.push_baseline_pos = None
                 state.push_reach_baseline = None
+                state.push_armed = False
+                state.push_fwd_baseline = None
             else:
                 if state.grabbing:
                     state.grabbing = False
@@ -403,11 +486,25 @@ class GestureTracker:
 
             pushed = False
             if not hand.is_fist and z_valid:
-                measured = self._reach(arm, config) if arm is not None else None
-                if measured is not None:
-                    reach, axis = measured
-                    pushed = self._update_push_reach(state, reach, axis, timestamp, config)
+                fwd = None
+                if body is not None and arm is not None:
+                    other = body.right_shoulder if hand.side == "left" else body.left_shoulder
+                    fwd = self._forward_mm(arm, other)
+                if fwd is not None:
+                    pushed, progress, cancelled = self._update_push_travel(state, fwd, timestamp, config)
+                    if progress is not None and not pushed:
+                        events.append(GestureEvent(
+                            skeleton_id=hand.skeleton_id, side=hand.side, kind="push_progress",
+                            x=x, y=y, edge=None, direction=None, timestamp=timestamp,
+                            progress=progress,
+                        ))
+                    elif cancelled:
+                        events.append(GestureEvent(
+                            skeleton_id=hand.skeleton_id, side=hand.side, kind="push_cancel",
+                            x=x, y=y, edge=None, direction=None, timestamp=timestamp,
+                        ))
                 else:
+                    # no usable torso/hand depth this frame — fall back
                     pushed = self._update_push(state, pos, timestamp, config)
 
             if pushed:

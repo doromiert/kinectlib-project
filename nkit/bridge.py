@@ -321,6 +321,7 @@ class Bridge:
                         "type": "gesture", "skeleton_id": ev.skeleton_id, "side": ev.side,
                         "kind": ev.kind, "x": ev.x, "y": ev.y, "edge": ev.edge,
                         "direction": ev.direction, "timestamp": ev.timestamp,
+                        "progress": ev.progress,
                     })
                 t6 = time.monotonic()
                 stage_totals["gesture"] = stage_totals.get("gesture", 0.0) + (t6 - t5)

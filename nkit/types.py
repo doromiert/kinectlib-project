@@ -120,8 +120,10 @@ GestureKind = Literal[
     "cursor_move",   # continuous; x, y in screen space
     "grab_start", "grab_end",   # fist held past a debounce window
     "push",                     # palm-mode z-push — maps to a click
-    "swipe_edge",                # hand entered from a screen edge, moved inward
-    "grab_swipe",                 # fist held + moved vertically past threshold
+    "push_progress",             # continuous 0.0-1.0 while a push is arming; draw it
+    "push_cancel",                # armed push abandoned — clear the indicator
+    "swipe_edge",                  # hand entered from a screen edge, moved inward
+    "grab_swipe",                   # fist held + moved vertically past threshold
 ]
 
 Edge = Literal["left", "right", "top", "bottom"]
@@ -138,6 +140,7 @@ class GestureEvent:
     edge:        Edge | None
     direction:   SwipeDirection | None
     timestamp:   float
+    progress:    float | None = None   # 0.0-1.0, push_progress only
 
 
 @dataclass
@@ -172,7 +175,26 @@ class GestureConfig:
     push_window_ms:                float = 600.0   # time window the delta must happen within
     push_debounce_ms:               float = 400.0   # minimum gap between two pushes
 
-    # push, arm-relative mode (preferred — see gestures.py:_update_push).
+    # push, travel mode (see gestures.py:_update_push_travel) — the hand's
+    # forward displacement from the torso, in mm, past a slow baseline.
+    #
+    # Measured rather than guessed: peri-tap averaging of a real session put
+    # a *deliberate* forward reach at a ~174mm peak with a clean rise-and-fall,
+    # while a deliberately SLIGHT push produced no coherent excursion at all —
+    # it sat inside the +-50-100mm noise floor of torso-relative depth. So the
+    # gesture has to be a real movement to be seeable, and the threshold sits
+    # above what incidental reaching produces.
+    #
+    # push_progress events stream 0.0-1.0 as the gesture arms, so the UI can
+    # draw a filling indicator. That's not decoration: it makes the gesture
+    # self-correcting, since you can see it charging and pull back before it
+    # fires, which is what makes a large deliberate push usable instead of
+    # startling.
+    push_travel_mm:        float = 260.0   # forward travel that completes a push
+    push_arm_mm:           float = 60.0    # travel before progress starts reporting
+    push_release_frac:     float = 0.5     # fall back through this fraction to fire
+
+    # push, arm-relative mode (legacy — see gestures.py:_update_push).
     # "reach" is |shoulder->wrist| / |shoulder->elbow|: roughly 1.0 with the
     # arm folded, ~2.0 fully extended. Being a RATIO of two body measurements
     # it's unitless and scale-free, so one threshold holds at desk range and

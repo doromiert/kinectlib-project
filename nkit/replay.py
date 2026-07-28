@@ -49,14 +49,20 @@ def marks(session: str | Path) -> list[dict]:
         return [json.loads(l) for l in f if l.strip()]
 
 
-def label_frames(session: str | Path, window_s: float = 0.4) -> dict[int, str]:
+def label_frames(session: str | Path, before_s: float = 0.1, after_s: float = 1.0) -> dict[int, str]:
     """
-    frame index -> action, for frames within window_s of a mark. Frames absent
-    from the result are rest.
+    frame index -> action, for frames in [mark - before_s, mark + after_s].
+    Frames absent from the result are rest.
 
-    window_s is an analysis choice, not a recorded one — a mark is an instant,
-    and how much of the motion around it counts as the gesture is exactly the
-    thing worth varying when tuning a detector.
+    The window is asymmetric and mostly AFTER the mark because that's where
+    the gesture actually is. Peri-tap averaging of a real session put the
+    forward-motion peak at t=+0.5s relative to the tap: you reach for the
+    button, tap, then do the thing. A symmetric window centred on the tap
+    captured the wrong half — for push it caught the retraction, giving the
+    gesture a median *backward* displacement and poisoning every classifier
+    trained on it.
+
+    Both bounds are analysis choices, not recorded ones; a mark is an instant.
     """
     ms = marks(session)
     if not ms:
@@ -64,7 +70,7 @@ def label_frames(session: str | Path, window_s: float = 0.4) -> dict[int, str]:
     out: dict[int, str] = {}
     for m in manifest(session):
         for k in ms:
-            if abs(m["t"] - k["t"]) <= window_s:
+            if -before_s <= m["t"] - k["t"] <= after_s:
                 out[m["i"]] = k["action"]
                 break
     return out
