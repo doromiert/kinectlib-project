@@ -190,9 +190,26 @@ class GestureConfig:
     # self-correcting, since you can see it charging and pull back before it
     # fires, which is what makes a large deliberate push usable instead of
     # startling.
-    push_travel_mm:        float = 260.0   # forward travel that completes a push
+    push_travel_mm:        float = 200.0   # forward travel that completes a push
     push_arm_mm:           float = 60.0    # travel before progress starts reporting
-    push_release_frac:     float = 0.5     # fall back through this fraction to fire
+    push_release_frac:     float = 0.5     # unused since push fires on completion
+
+    # A push must also be SHARP, not just far. Velocity and displacement fail
+    # in opposite directions, so requiring both is strictly stronger than
+    # either: a single-frame depth spike has velocity but no sustained travel,
+    # and leaning in has travel but no velocity. Same principle as the Kinect
+    # Sports darts throw, which keys on the flick rather than on how far the
+    # hand got.
+    #
+    # Requiring velocity is what lets push_travel_mm come DOWN (260 -> 200):
+    # the distance no longer has to carry the whole job of clearing the noise
+    # floor by itself, so the gesture can be smaller and still unambiguous.
+    # 450 rather than higher: this is the MEDIAN frame-to-frame rate across
+    # the push, not its peak, so it sits well below what the fastest instant
+    # of the gesture reaches. A 220mm push completing in 0.5s averages
+    # ~440mm/s and must still fire; a 1.7s lean over the same distance is
+    # ~130mm/s and must not.
+    push_min_velocity:     float = 450.0   # mm/s, body-relative, smoothed
 
     # push, arm-relative mode (legacy — see gestures.py:_update_push).
     # "reach" is |shoulder->wrist| / |shoulder->elbow|: roughly 1.0 with the

@@ -268,6 +268,29 @@ function updateCursorDot(ev, grabbing) {
     el.style.top = `${ev.y}px`;
   }
   if (grabbing !== undefined) el.classList.toggle("grabbing", grabbing);
+  return el;
+}
+
+// push arming: drive the ring straight off push_progress. The dot may not
+// exist yet if progress arrives before the first cursor_move for this hand,
+// so reuse updateCursorDot to create it.
+function setPushProgress(ev) {
+  const el = updateCursorDot(ev);
+  el.style.setProperty("--p", ev.progress ?? 0);
+  el.classList.add("arming");
+  el.classList.remove("fired");
+}
+
+function clearPushProgress(ev, fired) {
+  const el = cursorEls.get(`${ev.skeleton_id}:${ev.side}`);
+  if (!el) return;
+  if (fired) {
+    el.classList.add("fired");
+    setTimeout(() => el.classList.remove("fired", "arming"), 160);
+  } else {
+    el.classList.remove("arming");
+  }
+  el.style.setProperty("--p", 0);
 }
 
 function dispatchPointer(type, x, y) {
@@ -323,7 +346,16 @@ function handleGesture(ev) {
       playSound("grab_end");
       break;
 
+    case "push_progress":
+      setPushProgress(ev);
+      break;
+
+    case "push_cancel":
+      clearPushProgress(ev, false);
+      break;
+
     case "push": {
+      clearPushProgress(ev, true);
       const el = dispatchPointer("pointerdown", ev.x, ev.y);
       dispatchPointer("pointerup", ev.x, ev.y);
       if (el) {
@@ -364,8 +396,10 @@ const SLIDERS = [
   { key: "ir_fallback_brightness",     label: "IR fallback brightness",    min: 0,   max: 255,  step: 1,    def: 60 },
   { key: "cursor_margin_frac",         label: "Cursor margin (frac)",      min: 0,   max: 0.4,  step: 0.01, def: 0.15 },
   { key: "grab_debounce_ms",           label: "Grab debounce (ms)",        min: 0,   max: 1000, step: 10,   def: 150 },
-  { key: "push_delta_mm",              label: "Push delta (mm)",           min: 10,  max: 300,  step: 5,    def: 80 },
-  { key: "push_window_ms",             label: "Push window (ms)",          min: 50,  max: 1000, step: 10,   def: 350 },
+  { key: "push_travel_mm",             label: "Push travel (mm)",          min: 80,  max: 500,  step: 10,   def: 200 },
+  { key: "push_min_velocity",          label: "Push min speed (mm/s)",     min: 100, max: 1500, step: 25,   def: 450 },
+  { key: "push_arm_mm",                label: "Push arm at (mm)",          min: 20,  max: 200,  step: 5,    def: 60 },
+  { key: "push_window_ms",             label: "Push window (ms)",          min: 50,  max: 2000, step: 25,   def: 600 },
   { key: "push_debounce_ms",           label: "Push debounce (ms)",        min: 50,  max: 1500, step: 10,   def: 400 },
   { key: "swipe_edge_band_px",         label: "Swipe edge band (px)",      min: 20,  max: 400,  step: 5,    def: 120 },
   { key: "swipe_min_distance_px",      label: "Swipe min distance (px)",   min: 20,  max: 600,  step: 5,    def: 150 },

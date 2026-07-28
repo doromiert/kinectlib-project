@@ -64,6 +64,27 @@ body {
 .cursor-dot.right { border-color: var(--blue); background: rgba(74, 158, 255, 0.15); }
 .cursor-dot.grabbing { background: var(--amber); border-color: var(--amber); }
 
+/* push arming indicator — a ring that fills as the push travels forward.
+   This isn't decoration: seeing it charge is what makes a large deliberate
+   push usable, because you can pull back before it fires. --p is 0..1,
+   written from the push_progress event. */
+.cursor-dot::after {
+  content: "";
+  position: absolute;
+  inset: -13px;
+  border-radius: 50%;
+  opacity: 0;
+  background: conic-gradient(var(--amber) calc(var(--p, 0) * 360deg), transparent 0);
+  /* punch out the middle so it reads as a ring, not a pie */
+  mask: radial-gradient(circle, transparent 0 60%, #000 62%);
+  -webkit-mask: radial-gradient(circle, transparent 0 60%, #000 62%);
+  transition: opacity .12s;
+}
+.cursor-dot.arming::after { opacity: 1; }
+.cursor-dot.arming { border-color: var(--amber); }
+/* brief confirmation flash when it actually completes */
+.cursor-dot.fired::after { opacity: 1; background: var(--amber); transition: none; }
+
 .test-btn {
   position: absolute;
   top: 50%; left: 50%;

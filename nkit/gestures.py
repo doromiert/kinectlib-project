@@ -49,6 +49,35 @@ def _displacement_mm(a: tuple[float, float, float], b: tuple[float, float, float
     return (dx_mm, dy_mm, dz_mm)
 
 
+# Longer than a frame interval but far shorter than a gesture: bridges the
+# 1-in-3 dropouts while the hand is extended, without bridging a real absence.
+PUSH_MAX_SAMPLE_GAP_S = 0.20
+
+# how long an armed push survives with no usable hand depth at all
+PUSH_HOLD_THROUGH_DROPOUT_S = 0.35
+
+
+def _forward_velocity(hist: list) -> float:
+    """
+    Forward speed in mm/s from a short (timestamp, forward_mm) history.
+
+    Median of the frame-to-frame rates rather than the mean, and rates over
+    implausible gaps are dropped: a single bad depth sample otherwise produces
+    a velocity spike large enough to arm anything. Measured on a real session,
+    even after the depth-gate fix, unsmoothed rates reached 9 m/s while
+    someone sat still.
+    """
+    rates = [
+        (hist[i][1] - hist[i - 1][1]) / (hist[i][0] - hist[i - 1][0])
+        for i in range(1, len(hist))
+        if 0 < hist[i][0] - hist[i - 1][0] < 0.4
+    ]
+    if not rates:
+        return 0.0
+    rates.sort()
+    return rates[len(rates) // 2]
+
+
 def _magnitude(v: tuple[float, float, float]) -> float:
     return (v[0] ** 2 + v[1] ** 2 + v[2] ** 2) ** 0.5
 
@@ -88,6 +117,11 @@ class _HandState:
     push_fwd_baseline: float | None = None
     push_peak_travel:  float = 0.0
     push_armed:        bool = False
+    # short history of (timestamp, forward_mm) for the velocity gate — median
+    # of the last few frame-to-frame rates, so one bad depth sample can't
+    # manufacture a spike
+    push_fwd_hist:     list = field(default_factory=list)
+    push_fwd_last_ts:  float | None = None   # when we last had usable hand depth
 
     # swipe from edge
     swipe_edge_name:   str | None = None
@@ -152,21 +186,40 @@ class GestureTracker:
         axis = (forearm[0] / mag, forearm[1] / mag, forearm[2] / mag)
         return reach, axis
 
-    def _forward_mm(self, arm: tuple[Vec3, Vec3, Vec3], other_shoulder: Vec3) -> float | None:
-        """
-        How far in front of the torso the hand is, in mm.
+    # torso depth candidates, best first. Shoulders are the most reliable
+    # sample on a person (broad and flat, so the depth patch lands entirely on
+    # them) but they are NOT always visible — seated at a desk, or turned, or
+    # half out of frame, and requiring both of them meant push silently did
+    # nothing. Hips and nose are worse references individually but far better
+    # than having none, so take the median of whatever is actually there.
+    _TORSO_LANDMARKS = ("left_shoulder", "right_shoulder", "left_hip", "right_hip", "nose")
 
-        Torso depth is the midpoint of the two shoulders — the most reliable
-        depth on a person (broad and flat, so the sampling patch lands
-        entirely on them). Being body-relative, this is already
-        distance-invariant: it doesn't change when you stand further from the
-        camera, and it cancels leaning, since shoulders and hand move together.
-        """
-        shoulder, _elbow, wrist = arm
-        if shoulder.z <= 0 or other_shoulder.z <= 0 or wrist.z <= 0:
+    def _torso_z(self, body: BodyResult) -> float | None:
+        """Depth of the body's core, from whichever landmarks have valid depth."""
+        zs = []
+        for name in self._TORSO_LANDMARKS:
+            v = getattr(body, name, None)
+            if v is not None and v.z > 0:
+                zs.append(v.z)
+        if not zs:
             return None
-        torso_z = (shoulder.z + other_shoulder.z) / 2.0
-        return torso_z - wrist.z          # +ve = hand toward the camera
+        zs.sort()
+        return zs[len(zs) // 2]      # median: one bad landmark can't drag it
+
+    def _forward_mm(self, body: BodyResult, wrist: Vec3) -> float | None:
+        """
+        How far in front of the torso the hand is, in mm (+ve = toward camera).
+
+        Body-relative, so it's distance-invariant by construction — it doesn't
+        change when you stand further from the camera — and leaning cancels
+        out, since torso and hand move together.
+        """
+        if wrist.z <= 0:
+            return None
+        torso_z = self._torso_z(body)
+        if torso_z is None:
+            return None
+        return torso_z - wrist.z
 
     def _update_push_travel(
         self, state: _HandState, forward_mm: float, timestamp: float, config: GestureConfig,
@@ -184,11 +237,29 @@ class GestureTracker:
         from its hardest negative at exactly chance. Hand travel is what
         actually moves during a push.
 
-        Fires on the way BACK, not at peak: requiring the hand to return
-        means a hand that drifts forward and stays there (leaning in, reaching
-        for something and holding it) never completes, and it gives the user
-        the whole outward phase to see the indicator and abort.
+        Fires the moment travel completes, so the click lands when you push
+        rather than when you pull back — an earlier version fired on the
+        return, which was correct at rejecting drift but felt wrong to use.
+        Drift is rejected by push_window_ms instead: arming starts a clock, so
+        a hand that creeps forward slowly (leaning in, reaching for something
+        and holding it) times out and cancels before it ever completes.
         """
+        # A hand held out toward the camera is a small target whose depth patch
+        # is mostly background, so its depth sample drops out — measured, ~29%
+        # of frames once the elbow is 400mm+ forward, against 1-4% near the
+        # body. Rates computed ACROSS such a gap are fiction: the hand moved
+        # while we weren't looking, so the jump on reappearance reads as a huge
+        # velocity. That made push fire on the way back (the return is when
+        # depth comes good again) while feeling dead on the way out.
+        gap = timestamp - (state.push_fwd_last_ts or timestamp)
+        if gap > PUSH_MAX_SAMPLE_GAP_S:
+            state.push_fwd_hist.clear()
+        state.push_fwd_last_ts = timestamp
+
+        state.push_fwd_hist.append((timestamp, forward_mm))
+        del state.push_fwd_hist[:-5]
+        velocity = _forward_velocity(state.push_fwd_hist)
+
         if state.push_fwd_baseline is None:
             state.push_fwd_baseline = forward_mm
             return False, None, False
@@ -198,7 +269,7 @@ class GestureTracker:
         if not state.push_armed:
             # baseline only drifts while idle, so a slow push can't outrun it
             state.push_fwd_baseline = state.push_fwd_baseline * 0.93 + forward_mm * 0.07
-            if travel < config.push_arm_mm:
+            if travel < config.push_arm_mm or velocity < config.push_min_velocity:
                 return False, None, False
             state.push_armed = True
             state.push_peak_travel = travel
@@ -212,10 +283,9 @@ class GestureTracker:
             state.push_fwd_baseline = forward_mm
             return False, None, True          # took too long — abandon, clear the UI
 
-        if state.push_peak_travel >= config.push_travel_mm and \
-                travel <= state.push_peak_travel * config.push_release_frac:
+        if travel >= config.push_travel_mm:
             state.push_armed = False
-            state.push_fwd_baseline = forward_mm
+            state.push_fwd_baseline = forward_mm   # rebase where the hand now is
             if (timestamp - state.last_push_ts) * 1000.0 >= config.push_debounce_ms:
                 state.last_push_ts = timestamp
                 return True, 1.0, False
@@ -487,10 +557,23 @@ class GestureTracker:
             pushed = False
             if not hand.is_fist and z_valid:
                 fwd = None
-                if body is not None and arm is not None:
-                    other = body.right_shoulder if hand.side == "left" else body.left_shoulder
-                    fwd = self._forward_mm(arm, other)
-                if fwd is not None:
+                if body is not None:
+                    # the pose model's own wrist, not the hand model's — see
+                    # _reach's note on not mixing the two networks' estimates
+                    pose_wrist = body.left_wrist if hand.side == "left" else body.right_wrist
+                    fwd = self._forward_mm(body, pose_wrist)
+                if fwd is None and state.push_armed and \
+                        timestamp - (state.push_fwd_last_ts or 0.0) <= PUSH_HOLD_THROUGH_DROPOUT_S:
+                    # mid-push dropout: hold the armed state and keep the ring
+                    # up rather than cancelling. Dropouts cluster exactly when
+                    # the arm is extended, so cancelling on them aborts the
+                    # gesture precisely at its peak.
+                    events.append(GestureEvent(
+                        skeleton_id=hand.skeleton_id, side=hand.side, kind="push_progress",
+                        x=x, y=y, edge=None, direction=None, timestamp=timestamp,
+                        progress=_clip(state.push_peak_travel / max(1.0, config.push_travel_mm), 0.0, 1.0),
+                    ))
+                elif fwd is not None:
                     pushed, progress, cancelled = self._update_push_travel(state, fwd, timestamp, config)
                     if progress is not None and not pushed:
                         events.append(GestureEvent(
